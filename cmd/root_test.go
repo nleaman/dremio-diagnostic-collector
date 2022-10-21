@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -68,6 +69,20 @@ func TestValidateParameters(t *testing.T) {
 	if expectedError != err.Error() {
 		t.Errorf("expected: %v but was %v", expectedError, err.Error())
 	}
+}
+
+func TestInvalidCommand(t *testing.T) {
+
+	mytest := func() { fmt.Println("blah") }
+	testCmd := rootCmd(mytest)
+	err := testCmd.Execute()
+
+	expectedError := "Invalid command flag detected: <nil>"
+
+	if expectedError != actual.String() {
+		t.Errorf("expected: %v but was %v", expectedError, err.Error())
+	}
+
 }
 
 // Set of args for other tests

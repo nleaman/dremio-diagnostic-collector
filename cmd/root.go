@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/rsvihladremio/dremio-diagnostic-collector/collection"
 	"github.com/rsvihladremio/dremio-diagnostic-collector/kubernetes"
@@ -48,86 +49,123 @@ var Version = "dev"
 
 //var isEmbeddedK8s bool
 //var isEmbeddedSSH bool
+
 func getVersion() string {
 	return fmt.Sprintf("ddc %v-%v\n", Version, GitSha)
 }
 
 // rootCmd represents the base command when called without any subcommands
-var rootCmd = &cobra.Command{
-	Use:   "ddc",
-	Short: getVersion() + "ddc connects via to dremio servers collects logs into an archive",
-	Long: getVersion() + `ddc connects via ssh or kubectl and collects a series of logs and files for dremio, then puts those collected files in an archive
+func MainCmd(exitFunc func()) *cobra.Command {
+	return &cobra.Command{
+		Use:   "ddc",
+		Short: getVersion() + "ddc connects via to dremio servers collects logs into an archive",
+		Long: getVersion() + `ddc connects via ssh or kubectl and collects a series of logs and files for dremio, then puts those collected files in an archive
 examples:
 
 ddc --coordinator 10.0.0.19 --executors 10.0.0.20,10.0.0.21,10.0.0.22 --ssh-key $HOME/.ssh/id_rsa_dremio --output diag.zip
 
 ddc --k8s --kubectl-path /opt/bin/kubectl --coordinator default:role=coordinator-dremio --executors default:role=executor-dremio --output diag.tar.gz
 `,
-	Run: func(cmd *cobra.Command, args []string) {
-		if sshKeyLoc == "" {
-			sshDefault, err := sshDefault()
-			if err != nil {
-				log.Fatalf("unexpected error getting ssh directory '%v'. This is a critical error and should result in a bug report.", err)
+		Run: func(cmd *cobra.Command, args []string) {
+			// command line flags
+			cmd.Flags().StringVar(&coordinatorContainer, "coordinator-container", "dremio-master-coordinator", "for use with -k8s flag: sets the container name to use to retrieve logs in the coordinators")
+			cmd.Flags().StringVar(&executorsContainer, "executors-container", "dremio-executor", "for use with -k8s flag: sets the container name to use to retrieve logs in the executors")
+			cmd.Flags().StringVarP(&coordinatorStr, "coordinator", "c", "", "coordinator node to connect to for collection")
+			cmd.Flags().StringVarP(&executorsStr, "executors", "e", "", "either a common separated list or a ip range of executors nodes to connect to")
+			cmd.Flags().StringVarP(&sshKeyLoc, "ssh-key", "s", "", "location of ssh key to use to login")
+			cmd.Flags().StringVarP(&sshUser, "ssh-user", "u", "", "user to use during ssh operations to login")
+			cmd.Flags().StringVarP(&outputLoc, "output", "o", "diag.zip", "either a common separated list or a ip range of executors nodes to connect to")
+			cmd.Flags().StringVarP(&kubectlPath, "kubectl-path", "p", "kubectl", "where to find kubectl")
+			cmd.Flags().BoolVarP(&isK8s, "k8s", "k", false, "use kubernetes to retrieve the diagnostics instead of ssh, instead of hosts pass in labels to the --cordinator and --executors flags")
+			cmd.Flags().StringVarP(&dremioConfDir, "dremio-conf-dir", "C", "", "directory where to find the configuration files for kubernetes this defaults to /opt/dremio/conf and for ssh this defaults to /etc/dremio/")
+			cmd.Flags().StringVarP(&dremioLogDir, "dremio-log-dir", "l", "/var/log/dremio", "directory where to find the logs")
+			cmd.Flags().IntVarP(&durationDiagnosticTooling, "diag-tooling-collection-seconds", "d", 60, "the duration to run diagnostic collection tools like iostat, jstack etc")
+			cmd.Flags().IntVarP(&logAge, "log-age", "a", 0, "the maximum number of days to go back for log retreival (default is no filter and will retrieve all logs)")
+			// TODO implement embedded k8s and ssh support using go libs
+			//rootCmd.Flags().BoolVar(&isEmbeddedK8s, "embedded-k8s", false, "use embedded k8s client in place of kubectl binary")
+			//rootCmd.Flags().BoolVar(&isEmbeddedSSH, "embedded-ssh", false, "use embedded ssh go client in place of ssh and scp binary")
+			if sshKeyLoc == "" {
+				sshDefault, err := sshDefault()
+				if err != nil {
+					log.Fatalf("unexpected error getting ssh directory '%v'. This is a critical error and should result in a bug report.", err)
+				}
+				sshKeyLoc = sshDefault
 			}
-			sshKeyLoc = sshDefault
-		}
-		if dremioConfDir == "" {
+			// Conf and log defaults differ between two deployment types
+			// While it could be argued that the defautl log dir for k8s installs is the same often users will set that to be under a different path
+			// so their logs are written to a persistent volume
+			if dremioConfDir == "" {
+				if isK8s {
+					dremioConfDir = "/opt/dremio/conf/..data/"
+				} else {
+					dremioConfDir = "/etc/dremio/"
+				}
+			}
+			if dremioLogDir == "" {
+				if isK8s {
+					dremioLogDir = "/opt/dremio/data/log/"
+				} else {
+					dremioLogDir = "/var/log/dremio"
+				}
+			}
+			logOutput := os.Stdout
+
+			collectionArgs := collection.Args{
+				CoordinatorStr:            coordinatorStr,
+				ExecutorsStr:              executorsStr,
+				OutputLoc:                 filepath.Clean(outputLoc),
+				DremioConfDir:             filepath.Clean(dremioConfDir),
+				DremioLogDir:              filepath.Clean(dremioLogDir),
+				DurationDiagnosticTooling: durationDiagnosticTooling,
+				LogAge:                    logAge,
+			}
+
+			// All dremio deployments will be Linux based so - we have to switch the path seperator on these two elements
+			// since https://pkg.go.dev/path/filepath?utm_source=gopls#Clean shows that Clean will replace the slash with a seperator
+			confdir := collectionArgs.DremioConfDir
+			logdir := collectionArgs.DremioLogDir
+			collectionArgs.DremioConfDir = strings.Replace(confdir, `\`, `/`, -1)
+			collectionArgs.DremioLogDir = strings.Replace(logdir, `\`, `/`, -1)
+
+			err := validateParameters(collectionArgs, sshKeyLoc, sshUser, isK8s)
+			if err != nil {
+				fmt.Println("COMMAND HELP TEXT:")
+				fmt.Println("")
+				err := cmd.Help()
+				if err != nil {
+					log.Fatalf("unable to print help %v", err)
+				}
+				fmt.Println("")
+				fmt.Println("")
+				fmt.Printf("Invalid command flag detected: %v\n", err)
+				fmt.Println("")
+				exitFunc()
+			}
+			fmt.Println(getVersion())
+			var collectorStrategy collection.Collector
 			if isK8s {
-				dremioConfDir = "/opt/dremio/conf/..data/"
+				log.Print("using Kubernetes kubectl based collection")
+				collectorStrategy = kubernetes.NewKubectlK8sActions(kubectlPath, coordinatorContainer, executorsContainer)
 			} else {
-				dremioConfDir = "/etc/dremio/"
+				log.Print("using SSH based collection")
+				collectorStrategy = ssh.NewCmdSSHActions(sshKeyLoc, sshUser)
 			}
-		}
-		logOutput := os.Stdout
+			err = collection.Execute(collectorStrategy,
+				logOutput,
+				collectionArgs,
+			)
 
-		collectionArgs := collection.Args{
-			CoordinatorStr:            coordinatorStr,
-			ExecutorsStr:              executorsStr,
-			OutputLoc:                 filepath.Clean(outputLoc),
-			DremioConfDir:             filepath.Clean(dremioConfDir),
-			DremioLogDir:              filepath.Clean(dremioLogDir),
-			DurationDiagnosticTooling: durationDiagnosticTooling,
-			LogAge:                    logAge,
-		}
-
-		err := validateParameters(collectionArgs, sshKeyLoc, sshUser, isK8s)
-		if err != nil {
-			fmt.Println("COMMAND HELP TEXT:")
-			fmt.Println("")
-			err := cmd.Help()
 			if err != nil {
-				log.Fatalf("unable to print help %v", err)
+				log.Fatalf("unexpected error running collection '%v'", err)
 			}
-			fmt.Println("")
-			fmt.Println("")
-			fmt.Printf("Invalid command flag detected: %v\n", err)
-			fmt.Println("")
-			os.Exit(1)
-		}
-		fmt.Println(getVersion())
-		var collectorStrategy collection.Collector
-		if isK8s {
-			log.Print("using Kubernetes kubectl based collection")
-			collectorStrategy = kubernetes.NewKubectlK8sActions(kubectlPath, coordinatorContainer, executorsContainer)
-		} else {
-			log.Print("using SSH based collection")
-			collectorStrategy = ssh.NewCmdSSHActions(sshKeyLoc, sshUser)
-		}
-		err = collection.Execute(collectorStrategy,
-			logOutput,
-			collectionArgs,
-		)
-
-		if err != nil {
-			log.Fatalf("unexpected error running collection '%v'", err)
-		}
-	},
+		},
+	}
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
-	err := rootCmd.Execute()
+	err := MainCmd(osExit)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -151,26 +189,25 @@ func sshDefault() (string, error) {
 	return filepath.Join(home, ".ssh", "id_rsa"), nil
 }
 
-func init() {
+/*func init() {
 	// command line flags
-
-	rootCmd.Flags().StringVar(&coordinatorContainer, "coordinator-container", "dremio-master-coordinator", "for use with -k8s flag: sets the container name to use to retrieve logs in the coordinators")
-	rootCmd.Flags().StringVar(&executorsContainer, "executors-container", "dremio-executor", "for use with -k8s flag: sets the container name to use to retrieve logs in the executors")
-	rootCmd.Flags().StringVarP(&coordinatorStr, "coordinator", "c", "", "coordinator node to connect to for collection")
-	rootCmd.Flags().StringVarP(&executorsStr, "executors", "e", "", "either a common separated list or a ip range of executors nodes to connect to")
-	rootCmd.Flags().StringVarP(&sshKeyLoc, "ssh-key", "s", "", "location of ssh key to use to login")
-	rootCmd.Flags().StringVarP(&sshUser, "ssh-user", "u", "", "user to use during ssh operations to login")
-	rootCmd.Flags().StringVarP(&outputLoc, "output", "o", "diag.zip", "either a common separated list or a ip range of executors nodes to connect to")
-	rootCmd.Flags().StringVarP(&kubectlPath, "kubectl-path", "p", "kubectl", "where to find kubectl")
-	rootCmd.Flags().BoolVarP(&isK8s, "k8s", "k", false, "use kubernetes to retrieve the diagnostics instead of ssh, instead of hosts pass in labels to the --cordinator and --executors flags")
-	rootCmd.Flags().StringVarP(&dremioConfDir, "dremio-conf-dir", "C", "", "directory where to find the configuration files for kubernetes this defaults to /opt/dremio/conf and for ssh this defaults to /etc/dremio/")
-	rootCmd.Flags().StringVarP(&dremioLogDir, "dremio-log-dir", "l", "/var/log/dremio", "directory where to find the logs")
-	rootCmd.Flags().IntVarP(&durationDiagnosticTooling, "diag-tooling-collection-seconds", "d", 60, "the duration to run diagnostic collection tools like iostat, jstack etc")
-	rootCmd.Flags().IntVarP(&logAge, "log-age", "a", 0, "the maximum number of days to go back for log retreival (default is no filter and will retrieve all logs)")
+	cmd.Flags().StringVar(&coordinatorContainer, "coordinator-container", "dremio-master-coordinator", "for use with -k8s flag: sets the container name to use to retrieve logs in the coordinators")
+	cmd.Flags().StringVar(&executorsContainer, "executors-container", "dremio-executor", "for use with -k8s flag: sets the container name to use to retrieve logs in the executors")
+	cmd.Flags().StringVarP(&coordinatorStr, "coordinator", "c", "", "coordinator node to connect to for collection")
+	cmd.Flags().StringVarP(&executorsStr, "executors", "e", "", "either a common separated list or a ip range of executors nodes to connect to")
+	cmd.Flags().StringVarP(&sshKeyLoc, "ssh-key", "s", "", "location of ssh key to use to login")
+	cmd.Flags().StringVarP(&sshUser, "ssh-user", "u", "", "user to use during ssh operations to login")
+	cmd.Flags().StringVarP(&outputLoc, "output", "o", "diag.zip", "either a common separated list or a ip range of executors nodes to connect to")
+	cmd.Flags().StringVarP(&kubectlPath, "kubectl-path", "p", "kubectl", "where to find kubectl")
+	cmd.Flags().BoolVarP(&isK8s, "k8s", "k", false, "use kubernetes to retrieve the diagnostics instead of ssh, instead of hosts pass in labels to the --cordinator and --executors flags")
+	cmd.Flags().StringVarP(&dremioConfDir, "dremio-conf-dir", "C", "", "directory where to find the configuration files for kubernetes this defaults to /opt/dremio/conf and for ssh this defaults to /etc/dremio/")
+	cmd.Flags().StringVarP(&dremioLogDir, "dremio-log-dir", "l", "/var/log/dremio", "directory where to find the logs")
+	cmd.Flags().IntVarP(&durationDiagnosticTooling, "diag-tooling-collection-seconds", "d", 60, "the duration to run diagnostic collection tools like iostat, jstack etc")
+	cmd.Flags().IntVarP(&logAge, "log-age", "a", 0, "the maximum number of days to go back for log retreival (default is no filter and will retrieve all logs)")
 	// TODO implement embedded k8s and ssh support using go libs
 	//rootCmd.Flags().BoolVar(&isEmbeddedK8s, "embedded-k8s", false, "use embedded k8s client in place of kubectl binary")
 	//rootCmd.Flags().BoolVar(&isEmbeddedSSH, "embedded-ssh", false, "use embedded ssh go client in place of ssh and scp binary")
-}
+}*/
 
 func validateParameters(args collection.Args, sshKeyLoc, sshUser string, isK8s bool) error {
 	if args.CoordinatorStr == "" {
@@ -195,4 +232,9 @@ func validateParameters(args collection.Args, sshKeyLoc, sshUser string, isK8s b
 		}
 	}
 	return nil
+}
+
+// Wrapper function to OS exit to assist tests
+func osExit() {
+	os.Exit(1)
 }
